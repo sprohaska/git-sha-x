@@ -1,0 +1,180 @@
+#!/bin/bash
+# vim: sw=4
+set -o errexit -o nounset -o pipefail -o noglob
+
+usage() {
+    cat <<\EOF
+Usage:
+    git-sha-x [--sha256|--sha512] <type> <object>
+    git-sha-x [--sha256|--sha512] amend
+
+git-sha-x illustrates a potential solution for stronger cryptographic content
+verification in Git while keeping SHA1 content pointers.
+
+'git-sha-x <type> <object>' computes a hash tree similar to the SHA1-based Git
+history but using a different hash function.
+
+'git-sha-x amend' adds a footer to the HEAD commit message.  The footer
+contains the hash of the tree and a hash for each parent.  The commit can then
+be signed with GPG to confirm the tree and the entire history with a
+cryptographic strength that no longer depends on SHA1 but on the chosen
+git-sha-x hash and the GPG configuration.  Example:
+
+```
+git-sha-x amend && git-sha-x --sha512 amend && git commit -S --amend -C HEAD
+```
+
+EOF
+    exit 1
+}
+
+main() {
+    argparse "$@"
+    main_${opt_cmd}
+}
+
+argparse() {
+    opt_algo=sha256
+    opt_cmd=hash
+    while [ $# -gt 0 ]; do
+        case $1 in
+        -h|--help)
+            usage
+            ;;
+        --sha256)
+            opt_algo=sha256
+            shift
+            ;;
+        --sha512)
+            opt_algo=sha512
+            shift
+            ;;
+        -*)
+            echo >&2 "Unknown option '$1'."
+            exit 1
+            ;;
+        amend)
+            if [ $# -ne 1 ]; then
+                echo >&2 'Wrong number of arguments.'
+                exit 1
+            fi
+            opt_cmd=amend
+            return
+            ;;
+        *)
+            break
+            ;;
+        esac
+    done
+
+    if [ $# -ne 2 ]; then
+        echo >&2 'Wrong number of arguments.'
+        exit 1
+    fi
+
+    arg_type=$1
+    case ${arg_type} in
+    commit|tree|blob)
+        ;;
+    *)
+        echo >&2 "Invalid object type."
+        exit 1
+        ;;
+    esac
+
+    arg_object=$2
+}
+
+main_amend() {
+    initCache commit $(git rev-parse 'HEAD^{commit}')
+    git commit --amend \
+        -m "$(git show -s --pretty=%B | grep -v '^Hash-')" \
+        -m "$(fmtHashFooter)"
+}
+
+fmtHashFooter() {
+    (
+        git show -s --pretty=%B | grep '^Hash-' | grep -v "^Hash-${opt_algo}"
+        echo "Hash-${opt_algo}-tree: $(gitshax tree $(git show -s --pretty=%T))"
+        for c in $(git show -s --format=%P); do
+            echo "Hash-${opt_algo}-parent: $(gitshax commit ${c})"
+        done
+    ) \
+    | sort -t - -k 2,2 --stable
+}
+
+main_hash() {
+    object=$(git rev-parse -q --verify "${arg_object}^{${arg_type}}")
+    initCache ${arg_type} ${object}
+    gitshax ${arg_type} ${object}
+    echo
+}
+
+initCache() {
+    local ty=$1
+    local sha1=$2
+
+    cache="$(git rev-parse --git-dir)/sha-x-cache/${opt_algo}"
+    mkdir -p "${cache}"
+    (
+        cd "${cache}"
+        mkdir -p {0..9}{0..9} {0..9}{a..f} {a..f}{0..9} {a..f}{a..f}
+    )
+
+    # Seed cache in reverse order to avoid deep commit recursion.
+    local ce="${cache}/${sha1:0:2}/${sha1:2:38}"
+    if [ "${ty}" = 'commit' ] && ! [ -e "${ce}" ]; then
+        git rev-list --reverse "${sha1}" \
+        | while read -r c; do
+            echo >&2 "scan commit $c"
+            gitshax commit ${c} >/dev/null
+        done
+    fi
+}
+
+gitshax() {
+    local ty=$1
+    local sha1=$2
+    local ce="${cache}/${sha1:0:2}/${sha1:2:38}"
+    if ! [ -e "${ce}" ]; then
+        echo >&2 "walk ${sha1} ${ty}"
+        repr_${ty} ${sha1} | shax >"${ce}"
+    fi
+    cat "${ce}"
+}
+
+repr_commit() {
+    local sha1=$1
+    echo "tree $(gitshax tree $(git show -s --format=%T ${sha1}))"
+    for c in $(git show -s --format=%P ${sha1}); do
+        echo "parent $(gitshax commit ${c})"
+    done
+    git cat-file commit ${sha1}
+}
+
+repr_tree() {
+    local sha1=$1
+    local ty child
+    git ls-tree ${sha1} \
+    | while read -r _ ty child _; do
+        case ${ty} in
+        blob|tree)
+            echo "${ty} $(gitshax ${ty} ${child})"
+            ;;
+        commit)
+            echo >&2 "Warning: ignoring submodule commit"
+            ;;
+        esac
+    done
+    git cat-file tree ${sha1}
+}
+
+repr_blob() {
+    git cat-file blob $1
+}
+
+shax() {
+    openssl dgst -${opt_algo} | tr -d '\n'
+}
+
+main "$@"
